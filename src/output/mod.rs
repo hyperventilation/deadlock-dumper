@@ -1,0 +1,151 @@
+use std::fmt::{self, Write};
+use std::fs;
+use std::path::Path;
+
+use anyhow::Result;
+
+use chrono::{DateTime, Utc};
+
+use memflow::prelude::v1::*;
+
+use serde_json::json;
+
+use formatter::Formatter;
+
+use crate::analysis::*;
+
+mod buttons;
+mod formatter;
+mod interfaces;
+mod offsets;
+mod schemas;
+
+enum Item<'a> {
+    Buttons(&'a ButtonMap),
+    Interfaces(&'a InterfaceMap),
+    Offsets(&'a OffsetMap),
+    Schemas(&'a SchemaMap),
+}
+
+impl<'a> Item<'a> {
+    #[inline]
+    fn write(&self, fmt: &mut Formatter<'a>, file_type: &str) -> fmt::Result {
+        match file_type {
+            "rs" => self.write_rs(fmt),
+            _ => unimplemented!(),
+        }
+    }
+}
+
+trait CodeWriter {
+    fn write_rs(&self, fmt: &mut Formatter<'_>) -> fmt::Result;
+}
+
+impl<'a> CodeWriter for Item<'a> {
+    #[inline]
+    fn write_rs(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Item::Buttons(buttons) => buttons.write_rs(fmt),
+            Item::Interfaces(ifaces) => ifaces.write_rs(fmt),
+            Item::Offsets(offsets) => offsets.write_rs(fmt),
+            Item::Schemas(schemas) => schemas.write_rs(fmt),
+        }
+    }
+}
+
+pub struct Output<'a> {
+    file_types: &'a Vec<String>,
+    indent_size: usize,
+    out_dir: &'a Path,
+    result: &'a AnalysisResult,
+    timestamp: DateTime<Utc>,
+}
+
+impl<'a> Output<'a> {
+    pub fn new(
+        file_types: &'a Vec<String>,
+        indent_size: usize,
+        out_dir: &'a Path,
+        result: &'a AnalysisResult,
+    ) -> Result<Self> {
+        fs::create_dir_all(&out_dir)?;
+
+        Ok(Self {
+            file_types,
+            indent_size,
+            out_dir,
+            result,
+            timestamp: Utc::now(),
+        })
+    }
+
+    pub fn dump_all(&self, process: &mut IntoProcessInstanceArcBox<'_>) -> Result<()> {
+        let items = [
+            ("buttons", Item::Buttons(&self.result.buttons)),
+            ("interfaces", Item::Interfaces(&self.result.interfaces)),
+            ("offsets", Item::Offsets(&self.result.offsets)),
+        ];
+
+        for (file_name, item) in &items {
+            self.dump_item(file_name, item)?;
+        }
+
+        self.dump_schemas()?;
+        self.dump_info(process)?;
+
+        Ok(())
+    }
+
+    fn dump_info(&self, process: &mut IntoProcessInstanceArcBox<'_>) -> Result<()> {
+        let file_path = self.out_dir.join("info.json");
+
+        let content = serde_json::to_string_pretty(&json!({
+            "timestamp": self.timestamp.to_rfc3339(),
+        }))?;
+
+        fs::write(&file_path, &content)?;
+
+        Ok(())
+    }
+
+    fn dump_item(&self, file_name: &str, item: &Item) -> Result<()> {
+        for file_type in self.file_types {
+            let mut out = String::new();
+            let mut fmt = Formatter::new(&mut out, self.indent_size);
+
+            if file_type != "json" {
+                self.write_banner(&mut fmt)?;
+            }
+
+            item.write(&mut fmt, file_type)?;
+
+            let file_path = self.out_dir.join(format!("{}.{}", file_name, file_type));
+
+            fs::write(&file_path, out)?;
+        }
+
+        Ok(())
+    }
+
+    fn dump_schemas(&self) -> Result<()> {
+        for (module_name, (classes, enums)) in &self.result.schemas {
+            let map = SchemaMap::from([(module_name.clone(), (classes.clone(), enums.clone()))]);
+
+            self.dump_item(&slugify(&module_name), &Item::Schemas(&map))?;
+        }
+
+        Ok(())
+    }
+
+    fn write_banner(&self, fmt: &mut Formatter<'_>) -> Result<()> {
+        writeln!(fmt, "// Generated using https://github.com/a2x/cs2-dumper")?;
+        writeln!(fmt, "// {}\n", self.timestamp)?;
+
+        Ok(())
+    }
+}
+
+#[inline]
+fn slugify(input: &str) -> String {
+    input.replace(|c: char| !c.is_alphanumeric(), "_")
+}
